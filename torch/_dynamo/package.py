@@ -1167,7 +1167,10 @@ class CompilePackage:
         fn: Callable[..., Any] | None,
         dynamo: _DynamoCacheEntry | None = None,
         ignore_inlined_sources: bool = False,
+        explicit: bool = True,
     ) -> None:
+        # False for the package caching_precompile creates for every compile.
+        self.explicit = explicit
         self._innermost_fn = None
         self._codes: dict[types.CodeType, _DynamoCodeCacheEntry] = {}
 
@@ -1226,6 +1229,9 @@ class CompilePackage:
             self._codes = {self._innermost_fn.__code__: main}
             for code in codes:
                 self._codes[SerializedCode.to_code_object(code.python_code)] = code
+            self._resume_codes = {
+                code for code, entry in self._codes.items() if entry.install_to_global
+            }
             for key, code in self._codes.items():
                 if code.bypassed:
                     # install() skips a bypassed entry entirely, so its guarded
@@ -1433,6 +1439,9 @@ class CompilePackage:
             install_to_global=True,
         )
         self._resume_codes.add(python_code)
+
+    def is_resume_code(self, code: types.CodeType) -> bool:
+        return code in self._resume_codes
 
     def add_import_source(self, alias: str, module_name: str) -> None:
         if self._current_entry is None:
