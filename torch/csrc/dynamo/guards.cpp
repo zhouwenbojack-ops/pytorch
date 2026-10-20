@@ -206,12 +206,13 @@ bool TensorCheck::check(
     const c10::SymIntArrayRef& sym_sizes,
     const c10::SymIntArrayRef& sym_strides,
     const bool& requires_grad) {
+  // 检查 DispatchKeySet，包括 device, layout, dtype, device index, requires_grad
   if (dispatch_key_ != state.apply(dispatch_key_set).raw_repr() ||
       dtype_ != dtype || device_index_ != device.index() ||
       requires_grad_ != requires_grad) {
     return false;
   }
-
+  // 检查 rank, 每个静态维度的 size 和 stride
   auto ndim = sym_sizes.size();
   if (ndim != static_cast<size_t>(dim_)) {
     return false;
@@ -222,6 +223,7 @@ bool TensorCheck::check(
   for (auto i : c10::irange(ndim)) {
     auto known_size = sizes_[i];
     auto known_stride = strides_[i];
+    // 动态维度在`sizes_` /`strides_` 中保存为`nullopt`, `TENSOR_MATCH` 会跳过对应值
     if (known_size.has_value()) {
       if (known_size.value() != sizes[i]) {
         return false;
@@ -654,7 +656,7 @@ struct GlobalStateGuard {
     _default_dtype = at::get_default_dtype();
   }
 
-  bool check() const {
+  bool check() const { // 检查 trace 时与当前运行时的以下状态是否一致
     auto& ctx = at::globalContext();
     return (_grad_mode == at::GradMode::is_enabled() &&
             _autocast_state == AutocastState() &&
@@ -1723,7 +1725,7 @@ class LAMBDA_GUARD : public LeafGuard {
   py::function _guard_check_fn;
 };
 
-class TYPE_MATCH : public LeafGuard {
+class TYPE_MATCH : public LeafGuard { // `Py_TYPE(value)` 指针相等
  public:
   // type_id = id(type(obj))
   TYPE_MATCH(
@@ -1743,7 +1745,7 @@ class TYPE_MATCH : public LeafGuard {
   intptr_t _expected;
 };
 
-class ID_MATCH : public LeafGuard {
+class ID_MATCH : public LeafGuard { // `value` 对象指针相等
  public:
   // obj_id = id(obj)
   ID_MATCH(
@@ -1763,7 +1765,7 @@ class ID_MATCH : public LeafGuard {
   intptr_t _expected;
 };
 
-class NONE_MATCH : public LeafGuard {
+class NONE_MATCH : public LeafGuard { // value is None
  public:
   NONE_MATCH(
       RootGuardManager* root_guard_manager,
@@ -1775,7 +1777,7 @@ class NONE_MATCH : public LeafGuard {
   }
 };
 
-class TRUE_MATCH : public LeafGuard {
+class TRUE_MATCH : public LeafGuard { // value == True
  public:
   TRUE_MATCH(
       RootGuardManager* root_guard_manager,
@@ -1787,7 +1789,7 @@ class TRUE_MATCH : public LeafGuard {
   }
 };
 
-class FALSE_MATCH : public LeafGuard {
+class FALSE_MATCH : public LeafGuard { // value == False
  public:
   FALSE_MATCH(
       RootGuardManager* root_guard_manager,
@@ -1799,7 +1801,7 @@ class FALSE_MATCH : public LeafGuard {
   }
 };
 
-class EQUALS_MATCH : public LeafGuard {
+class EQUALS_MATCH : public LeafGuard { // 类型相同并执行`==`
  public:
   EQUALS_MATCH(
       RootGuardManager* root_guard_manager,
@@ -1954,7 +1956,7 @@ class DICT_LENGTH : public LeafGuard {
   Py_ssize_t _length;
 };
 
-class NOT_NONE : public LeafGuard {
+class NOT_NONE : public LeafGuard { // value != None
  public:
   NOT_NONE(RootGuardManager* root_guard_manager, py::object verbose_code_parts)
       : LeafGuard(root_guard_manager, std::move(verbose_code_parts)) {}
@@ -2159,7 +2161,7 @@ class SET_CONTAINS : public LeafGuard {
 };
 
 // Check if the float is nan
-class FLOAT_IS_NAN : public LeafGuard {
+class FLOAT_IS_NAN : public LeafGuard { // isnan(value)
  public:
   FLOAT_IS_NAN(
       RootGuardManager* root_guard_manager,
@@ -2175,7 +2177,7 @@ class FLOAT_IS_NAN : public LeafGuard {
 };
 
 // Check if the float is nan
-class COMPLEX_IS_NAN : public LeafGuard {
+class COMPLEX_IS_NAN : public LeafGuard { // isnan(value)
  public:
   COMPLEX_IS_NAN(
       RootGuardManager* root_guard_manager,
@@ -2377,7 +2379,7 @@ class STORAGE_OVERLAPPING : public RelationalGuard {
 /**
  * Symbolic Shape Guard.
  */
-class SYMBOLIC_SHAPE_GUARD : public RelationalGuard {
+class SYMBOLIC_SHAPE_GUARD : public RelationalGuard { // 动态维度跳过精确匹配后, 仍需验证符号约束
  public:
   SYMBOLIC_SHAPE_GUARD(
       RootGuardManager* root_guard_manager,
@@ -2488,7 +2490,7 @@ class SYMBOLIC_SHAPE_GUARD : public RelationalGuard {
   std::function<int8_t(int64_t*, double*)> _guard_check_fn;
 };
 
-class DYNAMIC_INDICES : public LeafGuard {
+class DYNAMIC_INDICES : public LeafGuard { // 检查用户标记的 dynamic 维度是否兼容
   // C++ equivalent of
   //  code.append(
   //      f"(({tensor_name}._dynamo_dynamic_indices.issubset({value._dynamo_dynamic_indices}))
@@ -2604,7 +2606,7 @@ struct WeakEntry {
  * GuardAccessor also owns the GuardManager associated with the retrieved
  * value from the GuardAccessor.
  */
-class GuardAccessor {
+class GuardAccessor { // 本身不判断类型或 shape, 而是从父对象取出子对象, 如果`getattr` 、`getitem` 或 locals 取值失败, 整个 guard tree 返回`false`
  public:
   GuardAccessor(
       RootGuardManager* root,
@@ -3602,7 +3604,7 @@ class RootGuardManager : public GuardManager {
     at::impl::PythonTorchFunctionTLS::set_disabled_state(
         at::impl::TorchFunctionDisabledState::ALL_DISABLED);
 
-    if (!GuardManager::check_accessors_nopybind(value)) {
+    if (!GuardManager::check_accessors_nopybind(value)) { // 通过 GuardAccessor 递归检查 locals/globals/属性/元素
       at::impl::PythonTorchFunctionTLS::set_disabled_state(old_state);
       _reset_relational_guard_state();
       return false;
@@ -4400,7 +4402,7 @@ class TENSOR_MATCH : public LeafGuard {
   }
 
   bool check_nopybind(PyObject* value) override { // borrowed ref
-    if (Py_TYPE(value) != _tensor_check->pytype) {
+    if (Py_TYPE(value) != _tensor_check->pytype) { // 检查 Python Tensor 子类类型
       return false;
     }
     return _tensor_check->check(
@@ -4758,7 +4760,7 @@ class GetItemGuardAccessor : public GuardAccessor {
  * NB: We don't check for name order in frame locals since it is constant
  * across frames corresponding to the same code object.
  */
-class FrameLocalsGuardAccessor : public GuardAccessor {
+class FrameLocalsGuardAccessor : public GuardAccessor { // 检查f_locals["x"]是否可以获取
  public:
   FrameLocalsGuardAccessor(
       RootGuardManager* root,
@@ -5615,7 +5617,7 @@ class FuncKwDefaultsGuardAccessor : public GuardAccessor {
  * Represents f_globals accessor. This sits as a child accessor of the
  * RootGuardManager.
  */
-class GlobalsGuardAccessor : public GuardAccessor {
+class GlobalsGuardAccessor : public GuardAccessor { // 检查 f_globals 是否可以获取
  public:
   GlobalsGuardAccessor(
       RootGuardManager* root,

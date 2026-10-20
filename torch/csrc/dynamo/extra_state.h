@@ -21,11 +21,11 @@ extern "C" {
 #endif
 
 enum FrameAction {
-  DEFAULT, // look through the cache, compile if not found
+  DEFAULT, // 查缓存, miss 后允许编译
   SKIP, // eager
-  RUN_ONLY, // look through the cache, run eager if not found
+  RUN_ONLY, // 查缓存, 但 miss 后不编译
 };
-
+// 分别决定 当前frame 和 子frame 如何执行
 typedef struct FrameExecStrategy {
   enum FrameAction cur_action; // action to take for current frame
   enum FrameAction recursive_action; // action to take for recursive frames

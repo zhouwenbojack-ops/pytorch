@@ -21,9 +21,9 @@ static py::object dynamo_call_callback(
     py::handle callback,
     THP_EVAL_API_FRAME_OBJECT* _frame,
     FrameLocalsMapping* locals,
-    CacheEntry* cache_entry,
-    FrameState* frame_state) {
-  THPPyInterpreterFrame* frame = THPPyInterpreterFrame_New(_frame);
+    CacheEntry* cache_entry, // 已有缓存链表的第一个条目, 可能为空
+    FrameState* frame_state) { // 同一 code object 跨调用共享的状态, 主要用于自动动态形状检测
+    THPPyInterpreterFrame* frame = THPPyInterpreterFrame_New(_frame); // 当前 Python frame, 包括 code、globals、locals
   TORCH_CHECK(
       frame, "Dynamo failed to initialize CPython interpreter frame wrapper");
   frame->locals = (PyObject*)framelocals_mapping_to_dict(locals);
@@ -124,7 +124,7 @@ PyObject* dynamo__custom_eval_frame(
       frame->f_iblock);
 #endif
 
-  if (throw_flag) {
+  if (throw_flag) { // 正在异常展开 or Cpython tracing enable -> 执行原始字节码
     // When unwinding generators, eval frame is called with throw_flag ==
     // true.  Frame evaluation is supposed to continue unwinding by propagating
     // the exception.  Dynamo doesn't really know how to do this, nor does it
@@ -196,7 +196,12 @@ PyObject* dynamo__custom_eval_frame(
     return eval_result;
   }
 #endif
-
+  /*
+   * ExtraState:
+   *  - CacheEntry[]
+   *  - FrameState
+   *  - FrameExecStrategy
+   */
   ExtraState* extra = get_extra_state(F_CODE(frame));
 
   if (callback.is(py::bool_(false)) && extra == nullptr) {
@@ -211,12 +216,12 @@ PyObject* dynamo__custom_eval_frame(
   }
 
   // Get recursive action
-  FrameExecStrategy strategy = extra_state_get_exec_strategy(extra);
+  FrameExecStrategy strategy = extra_state_get_exec_strategy(extra); // 获取 code object 的 extra.strategy
   recursive_callback =
       _callback_from_action(recursive_callback, strategy.recursive_action);
 
   // Skip this frame
-  if (strategy.cur_action == SKIP) {
+  if (strategy.cur_action == SKIP) { // SKIP ->  原始字节码
     DEBUG_TRACE("skip %s", get_frame_name(frame));
     eval_default();
     return eval_result;
@@ -230,15 +235,16 @@ PyObject* dynamo__custom_eval_frame(
   // We don't run the current custom_eval_frame behavior for guards.
   // So we temporarily set the callback to Py_None to drive the correct behavior
   // in the shim.
-  eval_frame_callback_set(Py_None);
+  eval_frame_callback_set(Py_None); // 暂时关闭 Dynamo callback
 
   DEBUG_CHECK(PyDict_CheckExact(frame->f_globals));
   DEBUG_CHECK(PyDict_CheckExact(frame->f_builtins));
 
   _PytorchRecordFunctionState* rf =
       _pytorch_record_function_enter(cache_lookup_profiler_str);
+  // lookup 的返回状态: nullptr -> guard check 异常; Py_None -> cache miss; PyCodeObject* -> cache hit~
   PyObject* maybe_cached_code = nullptr;
-  lookup(
+  lookup( // 查询编译缓存
       extra,
       locals.get(),
       backend,
@@ -275,7 +281,7 @@ PyObject* dynamo__custom_eval_frame(
     }
   }
 
-  if (maybe_cached_code != Py_None) {
+  if (maybe_cached_code != Py_None) { // cache 命中, 执行 dynamo 改写后的字节码
     cached_code = (PyCodeObject*)maybe_cached_code;
     // used cached version
     DEBUG_TRACE("cache hit %s", get_frame_name(frame));
@@ -295,7 +301,7 @@ PyObject* dynamo__custom_eval_frame(
     return eval_result;
   }
 
-  if (run_only) {
+  if (run_only) { // cache miss & run_only, 执行原始字节码
     eval_default();
     return eval_result;
   }
@@ -315,9 +321,9 @@ PyObject* dynamo__custom_eval_frame(
       fail();
       return eval_result;
     }
-    callback_result = dynamo_call_callback(
+    callback_result = dynamo_call_callback( // cache miss, 进入 dynamo 编译流程, 返回 ConvertFrameReturn
         callback, frame, locals.get(), cache_entry, frame_state);
-    new_strategy =
+    new_strategy = // 更新执行策略
         callback_result.attr("frame_exec_strategy").cast<FrameExecStrategy>();
     apply_to_code = callback_result.attr("apply_to_code").cast<bool>();
     guarded_code = callback_result.attr("guarded_code").ptr();
@@ -361,7 +367,7 @@ PyObject* dynamo__custom_eval_frame(
     // reference seems wrong. Therefore, we directly access the
     // extra->cache_entry. extra won't be NULL here.
     CacheEntry* new_cache_entry =
-        create_cache_entry(extra, guarded_code, backend);
+        create_cache_entry(extra, guarded_code, backend); // guards + modified code + backend ...
 
     // Update the existing cache_entry on the extra object. This extra object
     // is sitting on the extra scratch space, we are just changing the
@@ -370,7 +376,7 @@ PyObject* dynamo__custom_eval_frame(
     // Re-enable custom behavior
     cached_code = CacheEntry_get_code(new_cache_entry),
     trace_annotation = CacheEntry_get_trace_annotation(new_cache_entry);
-    eval_custom();
+    eval_custom(); // 执行新生成的dynamo字节码
   } else {
     eval_default();
   }

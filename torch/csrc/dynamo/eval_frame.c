@@ -22,6 +22,7 @@ PyObject* guard_error_hook = NULL;
 PyObject* guard_complete_hook = NULL;
 
 typedef struct {
+  // 计数大于0, 表示还有线程在使用 dynamo shim, 还不能恢复 default evaluator
   int active_dynamo_threads;
 } ModuleState;
 
@@ -214,6 +215,7 @@ static void enable_eval_frame_shim(PyThreadState* tstate) {
   if (_PyInterpreterState_GetEvalFrameFunc(tstate->interp) !=
       &dynamo_custom_eval_frame_shim) {
     DEBUG_CHECK(previous_eval_frame == NULL);
+    // 替换 CPython 的 evaluator
     previous_eval_frame = _PyInterpreterState_GetEvalFrameFunc(tstate->interp);
     _PyInterpreterState_SetEvalFrameFunc(
         tstate->interp, &dynamo_custom_eval_frame_shim);
@@ -574,12 +576,17 @@ static PyObject* decrement_working_threads(
 
   Py_RETURN_NONE;
 }
-
+/*
+ * 给当前线程设置 Dynamo callback:
+ * 1. old_cb = thread_local.cb
+ * 2. thread_local.cb = new_cb
+ * 3. return old_cb
+ */
 static PyObject* set_eval_frame(PyObject* new_callback, PyObject* module) {
   // Change the eval frame callback and return the old one
-  //  - None: disables TorchDynamo
-  //  - False: run-only mode (reuse existing compiles)
-  //  - Python callable(): enables TorchDynamo
+  //  - None: disables TorchDynamo -> 关闭Dynamo, eager 模式
+  //  - False: run-only mode (reuse existing compiles) -> 只运行使用现有的cache, 不允许执行时编译
+  //  - Python callable(): enables TorchDynamo -> miss时调用 Dynamo 编译
   PyObject* old_callback = eval_frame_callback_get();
 
   // Common case: if Dynamo is actually off, we might see a lot of
@@ -588,11 +595,11 @@ static PyObject* set_eval_frame(PyObject* new_callback, PyObject* module) {
   // reference counts.
   if (old_callback != new_callback) {
     if (new_callback == Py_None) {
-      decrement_working_threads(PyThreadState_GET(), module);
+      decrement_working_threads(PyThreadState_GET(), module); // -> enable_eval_frame_default
     } else {
-      increment_working_threads(PyThreadState_GET(), module);
+      increment_working_threads(PyThreadState_GET(), module); // -> enable_eval_frame_shim
     }
-
+    // new_cb 是借用引用, 函数返回后可能失效, 所以要创建一个强引用保证生命周期
     Py_INCREF(new_callback);
 
     // Set thread local callback. This will drive behavior of our shim, if/when
@@ -728,7 +735,7 @@ static int clear_state(PyObject* module) {
 bool is_skip_guard_eval_unsafe = false;
 
 static PyMethodDef _methods[] = {
-    {"set_eval_frame", set_eval_frame_py, METH_O, NULL},
+    {"set_eval_frame", set_eval_frame_py, METH_O, NULL}, // METH_O 表示 py 函数只接受一个参数
     {"set_skip_guard_eval_unsafe", set_skip_guard_eval_unsafe, METH_O, NULL},
     {"get_eval_frame_callback", get_eval_frame_callback_py, METH_NOARGS, NULL},
     {"reset_code", reset_code, METH_O, NULL},

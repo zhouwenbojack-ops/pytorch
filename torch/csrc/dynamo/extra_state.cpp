@@ -137,17 +137,22 @@ static bool backend_match(PyObject* saved_backend, PyObject* backend) {
   return true;
 }
 
+/*
+ * 对同一个 Python`code object`, 从多个已编译版本中找到一个适用于当前 frame locals 和当前 backend 的版本. (顺序扫描cache entry, 执行guards验证)
+ */
 void lookup(
-    ExtraState* extra_state,
-    FrameLocalsMapping* f_locals,
-    PyObject* backend,
-    PyObject** maybe_cached_code,
-    const char** trace_annotation,
+    ExtraState* extra_state, // 当前 PyCodeObject的缓存状态
+    FrameLocalsMapping* f_locals, // 当前 frame 的参数, 局部变量, 闭包变量
+    PyObject* backend, // torch.compile 使用的编译器后端, 默认 Inductor
+    PyObject** maybe_cached_code, // 输出: cache-hit 的 modified code
+    const char** trace_annotation, // 输出: 对应编译区域的profiler标记
     bool is_skip_guard_eval_unsafe) {
-  size_t index = 0;
-  CacheEntry* found = nullptr;
-
-  for (const auto& entry : extra_state->precompile_entries) {
+  size_t index = 0; // guard 失败时, 诊断当前执行到第几个 cache entry
+  CacheEntry* found = nullptr; // 命中的 cache entry
+  // 优先查询预编译缓存
+  for (const auto& entry : extra_state->precompile_entries) { // 来自序列化的 CompilePackage
+    // 不检查 backend, 不参与 LRU 移动
+    // 因为 CompilePackage.install(backends) 在安装时 callback 已经显式绑定了 backend
     if (torch::dynamo::run_root_guard_manager(entry.root_mgr, f_locals)) {
       *maybe_cached_code = entry.code.ptr();
       return;
@@ -155,24 +160,27 @@ void lookup(
   }
 
   for (CacheEntry& cache_entry : extra_state->cache_entry_list) {
-    // Check backend. Py_False means run only mode.
-
+    // 检查 backend. Py_False means run only mode.
+    // backend_match 先比较指针是否是同一个对象, 再调用 __eq__ 比较是否是两个配置相同的 _TorchCompileInductorWrapper
     bool valid = backend == Py_False ||
         backend_match(cache_entry.backend.ptr(), backend);
 
     if (valid) {
       try {
         if (is_skip_guard_eval_unsafe) {
+          // 只执行能够区分已有缓存版本的 guards, 减少开销
           valid = torch::dynamo::run_root_guard_manager(
               cache_entry.diff_guard_root_mgr, f_locals);
         } else {
+          // 检查完整的root_mgr, 包括Tensor类型, dtype, device, shape, stride, 对象类型, 全局状态等
           valid = torch::dynamo::run_root_guard_manager(
               cache_entry.root_mgr, f_locals);
         }
       } catch (py::error_already_set& e) {
+        // guard 抛异常是运行时错误
         if (guard_error_hook) {
           py::handle guard_error_hook_handle(guard_error_hook);
-          py::handle f_locals_dict = (PyObject*)f_locals->to_dict();
+          py::handle f_locals_dict = (PyObject*)f_locals->to_dict(); // 把 FrameLocalsMapping 转成 dict 给 hook 使用
           guard_error_hook_handle(
               cache_entry.guard_manager,
               cache_entry.code,
@@ -193,7 +201,7 @@ void lookup(
     }
     ++index;
   }
-  if (found) {
+  if (found) { // 命中后的 LRU 调整
     if (use_lru) {
       extra_state->move_to_front(found);
     }
@@ -201,7 +209,7 @@ void lookup(
     *trace_annotation = found->trace_annotation.c_str();
     return;
   }
-  *maybe_cached_code = py::none().ptr();
+  *maybe_cached_code = py::none().ptr(); // Py_None, cache 全 miss
 }
 
 CacheEntry* create_cache_entry(
